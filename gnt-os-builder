@@ -1,0 +1,306 @@
+#!/usr/bin/python
+""""""
+__VERSION__ = '0.1'
+__AUTHOR__  = 'Bram Swenson <bram@craniumisajar.com>'
+
+import logging
+import sys
+import os
+import tempfile
+import shutil
+import tarfile
+import traceback
+
+import argparse
+
+from utils import CleanupRunner
+from utils import run_command
+from configurations import CoreConfiguration
+from configurations import OsConfiguration
+from debootstrap import debootstrap_mktarball
+from net import hostname_fqdn
+from gnt import gnt_node_list
+from gnt import gnt_cluster_getmaster
+from gnt import gnt_cluster_copyfile
+from gnt import gnt_cluster_command
+
+    
+class BuilderRunner(CleanupRunner):
+    def __init__(self, parsed_args, *args, **kwargs):
+        super(BuilderRunner, self).__init__(self, *args, **kwargs)
+        self.parsed_args = parsed_args
+        self.config = CoreConfiguration(self.parsed_args.conf)
+        self.os_configs_dir = self.config.get('core',
+            'os_configs_dir').strip("\"'")
+        self.os_config_filename = '%s.conf' % self.parsed_args.name
+        self.os_config_path = os.path.join(self.os_configs_dir, 
+            self.os_config_filename)
+        self.ganeti_os_dir = self.config.get('os',
+            'ganeti_os_dir').strip("\"'")
+        #self.os_install_dir = os.path.join(self.ganeti_os_dir, self.parsed_args.name)
+        self.core_dir = self.config.get('core', 'core_dir').strip("\"'")
+
+    def update_os_config(self):
+        logging.info('%s updating existing os config: %s' % (
+            self.__class__.__name__, self.parsed_args.name))
+        self.os_config = OsConfiguration(self.os_config_path)
+        self.os_config.read()
+        updated = []
+        if self.parsed_args.arch:
+            updated.append('arch')
+            self.os_config.set('os', 'arch', self.parsed_args.arch)
+        if self.parsed_args.suite:
+            updated.append('suite')
+            self.os_config.set('os', 'suite', self.parsed_args.suite)
+        if self.parsed_args.chroot_script:
+            updated.append('chroot_script')
+            self.os_config.set('os', 'chroot_script',
+                self.parsed_args.chroot_script)
+        if self.parsed_args.disk:
+            updated.append('disk')
+            self.os_config.set('os', 'disks', ','.join(self.parsed_args.disk))
+        if self.parsed_args.package:
+            updated.append('package')
+            self.os_config.set('os', 'packages',
+                               ','.join(self.parsed_args.package))
+        self.os_config.write()
+        return updated
+
+    def create_os_config(self):
+        logging.info('%s creating new os config: %s' % (
+            self.__class__.__name__, self.parsed_args.name))
+        arch = self.config.get('os', 'default_arch')
+        suite = self.config.get('os', 'default_suite')
+        if self.parsed_args.arch:
+            arch = self.parsed_args.arch
+        if self.parsed_args.suite:
+            suite = self.parsed_args.suite
+        try:
+            self.os_config = OsConfiguration(self.os_config_path,
+                name=self.parsed_args.name, arch=arch, suite=suite,
+                chroot_script=self.parsed_args.chroot_script, 
+                disks=self.parsed_args.disk, packages=self.parsed_args.package)
+        except Exception, why:
+            logging.critical('%s %s' % (self.__class__.__name__, why))
+            sys.exit(1)
+        #self.os_config.write()
+        tarball_file = self.get_tarball_path()
+        self.os_config.set('cache', 'tarball_path', tarball_file)
+        self.os_config.write()
+
+    def remove_os_config(self):
+        logging.info('%s removing os config: %s' % (
+            self.__class__.__name__, self.parsed_args.name))
+        tarfile_path = self.get_tarball_path()
+        if os.path.exists(tarfile_path):
+            os.unlink(tarfile_path)
+        # try to remove the os_install_dir links
+        for l in [ 'create', 'import', 'export', 'rename', 'os.conf',
+                   'ganeti_api_version', ]:
+            os.unlink(os.path.join(self.os_install_dir, l))
+        # try to remove the os_install_dir
+        os.rmdir(self.os_install_dir)
+        # try to remove the main config
+        os.unlink(self.os_config_path)
+        
+
+    def create_install_dir(self):
+        # create dir for new os
+        if not os.path.exists(self.os_install_dir):
+            os.mkdir(self.os_install_dir)
+        # create links for create/import/export/rename scripts
+        for d in [ 'create', 'import', 'export', 'rename' ]:
+            src = os.path.join(self.core_dir, d)
+            dst = os.path.join(self.os_install_dir, d)
+            if os.path.exists(dst):
+                os.unlink(dst)
+            os.symlink(src, dst)
+        # and the api file
+        api_file_dst = os.path.join(self.os_install_dir, 'ganeti_api_version')
+        api_file_src = os.path.join(self.os_configs_dir, 'ganeti_api_version')
+        if os.path.exists(api_file_dst):
+            os.unlink(api_file_dst)
+        os.symlink(api_file_src, api_file_dst)
+        # and the os config file
+        config_dst = os.path.join(self.os_install_dir, 'os.conf')
+        if os.path.exists(config_dst):
+            os.unlink(config_dst)
+        os.symlink(self.os_config_path, config_dst)
+
+    def get_tarball_path(self):
+        if not hasattr(self, 'os_config'):
+            self.os_config = OsConfiguration(self.os_config_path)
+            self.os_config.read()
+        tardir = self.config.get('cache', 'tarball_dir')
+        if not os.path.isdir(tardir):
+            logging.critical('%s tarball_dir does not exist: %s' % (
+                self.__class__.__name__, tardir))
+            sys.exit(1)
+        return os.path.join(tardir, '%s.tgz' % (
+            self.os_config.get('os', 'name')))
+        
+    def create_cache(self, force_update=False):
+        tarfile_path = self.get_tarball_path()
+        if os.path.exists(tarfile_path) and force_update is False:
+            logging.info('%s cache for debootstrap already exists' % (
+                self.__class__.__name__))
+            return
+        logging.info('%s creating a cache for debootstrap' % (
+            self.__class__.__name__))
+        tmpdir = tempfile.mkdtemp(prefix='gnt-os-builder-cache')
+        suite = self.os_config.get('os', 'suite')
+        arch = self.os_config.get('os', 'arch')
+        include = self.os_config.get('os', 'packages').split(',')
+        deboot_out = debootstrap_mktarball(suite, tmpdir, tarfile_path, arch=arch, 
+            include=include)
+        #shutil.rmtree(tmpdir)
+        logging.info('%s cache creation success: %s' % (self.__class__.__name__,
+            deboot_out))
+
+    def list_configurations(self, retval=False):
+        # get a list of all the config files
+        configs = []
+        for dirpath, dirnames, filenames in os.walk(self.os_configs_dir):
+            for f in filenames:
+                if f.endswith('.conf'):
+                    configs.append(os.path.splitext(f)[0])
+        if retval is not False:
+            return configs
+        for config in configs:
+            logging.info('found config: %s' % config)
+
+    def distribute(self):
+        # ensure we are on the master or error and get hostname
+        hostname = hostname_fqdn().strip()
+        master = gnt_cluster_getmaster().strip()
+        if master != hostname:
+            logging.critical('distribute can only be run from the master node')
+            sys.exit(1)
+        logging.info('%s starting distribute run on master' % (self.__class__.__name__))
+        # archive the core_dir to /tmp
+        tarfile_path = '/tmp/gnt-os-builder.tar.bz2'
+        tarfile_f = tarfile.open(name=tarfile_path, mode='w:bz2')
+        for dirpath, dirnames, filenames in os.walk(self.core_dir):
+            for file in filenames:
+                path = os.path.join(self.core_dir, dirpath, file)
+                tarfile_f.add(path)
+        tarfile_f.close()
+        logging.debug('%s distribute archive created at: %s' % (
+            self.__class__.__name__, tarfile_path))
+        # get a list of nodes and remove the master
+        nodes = [ node.strip() for node in gnt_node_list().splitlines() \
+                  if node.strip() != master ]
+        # copy the archive to the cluster nodes except self
+        copyfile_output = gnt_cluster_copyfile(tarfile_path, nodes=nodes)
+        # untar the archive on the cluster nodes except self
+        core_dir_parent = os.path.join(os.path.split(self.core_dir)[:-1])
+        command_output = gnt_cluster_command('tar -jxvf %s -C /' % (
+            tarfile_path), nodes=nodes)
+        # run import on each config file on each cluster node except self
+        configs = self.list_configurations(retval=True)
+        gnt_os_builder_path = os.path.join(self.core_dir, 'gnt-os-builder')
+        for config in configs:
+            import_output = gnt_cluster_command('%s --import --name %s' % (
+                gnt_os_builder_path, config), nodes=nodes)
+
+    def run(self):
+        logging.info('%s run starting' % self.__class__.__name__)
+        # test to see if we are in distribute mode
+        if self.parsed_args.distribute is True:
+            return self.distribute()
+        if self.parsed_args.list is True:
+            return self.list_configurations()
+        if not self.parsed_args.name:
+            logging.critical(
+                'name is a required argument for modes except distribute')
+            sys.exit(1)
+        self.os_install_dir = os.path.join(self.ganeti_os_dir, self.parsed_args.name)
+        # test to see if we already have a config with the same name
+        if os.path.exists(self.os_config_path):
+            logging.debug('%s config exists for %s' % (self.__class__.__name__,
+                self.parsed_args.name))
+            # see if we are in remove mode
+            if self.parsed_args.remove is True:
+                self.remove_os_config()
+                return
+            # see if we are in import mode
+            if self.parsed_args.importing is True:
+                self.create_install_dir()
+                self.create_cache()
+                return
+            # if not then check for update mode or error
+            if self.parsed_args.update is not True:
+                errstr = '%s os config named %s already exists. updates ' + \
+                         'require use of the update flag'
+                logging.critical(errstr, self.__class__.__name__, 
+                                 self.parsed_args.name)
+                sys.exit(1)
+            # else update the existing config with updated attributes
+            else:
+                updated = self.update_os_config()
+                force_update = False
+                if 'package' in updated:
+                    force_update = True
+                self.create_cache(force_update=force_update)
+                return
+        # see if we are in remove mode as we should not be
+        if self.parsed_args.remove is True:
+            logging.critical('%s configuration not found: %s' % (
+                self.__class__.__name__, self.parsed_args.name))
+            sys.exit(1)
+        # if we dont write the config from supplied attributes
+        self.create_os_config()
+        self.create_install_dir()
+        self.create_cache(force_update=True)
+        logging.info('%s run complete' % self.__class__.__name__)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Build a directory of scripts suitable for use by \
+            gnt-instance create and gnt-backup import/export commands',
+        epilog='Projected from the cranium of %s' % __AUTHOR__,
+        version='0.1')
+    parser.add_argument('-n', '--name', type=unicode,
+        help='the name of the os image to be created')
+    parser.add_argument('-s', '--suite', type=unicode,
+        help='the name of the os suite to create from')
+    parser.add_argument('-a', '--arch', type=unicode,
+        help='the name of the os architechture to create for')
+    parser.add_argument('-t', '--chroot_script', type=unicode,
+        help='the path to a script to be run in chroot on the new os')
+    parser.add_argument('-p', '--package', type=unicode, action='append',
+        help='the name of an additional package to install')
+    parser.add_argument('-d', '--disk', type=unicode, action='append',
+        help='add a disk configuration with format disk:part:size:type:path\n\
+              ie. --disk 1:1:256m:ext3:/boot --disk 1:2:10g+:ext4:/ --disk \
+              1:3:1g:swap (+ flags a partition to use all free disk space)')
+    rundir = os.path.dirname(os.path.abspath(sys.argv[0]))
+    default_config_path = os.path.join(rundir, 'config', 'gnt-os-builder.conf')
+    parser.add_argument('-c', '--conf', type=unicode,
+        default=default_config_path,
+        help='path to configuration file (defaults to %s)' % \
+            default_config_path)
+    parser.add_argument('-l', '--log', type=unicode,
+        help='log command output to a file instead of stdout')
+    parser.add_argument('-V', '--loglevel', type=unicode, default='DEBUG',
+        help='name of logging level to use')
+    parser.add_argument('-u', '--update', action='store_true',
+        help='update an existing configuration')
+    parser.add_argument('-r', '--remove', action='store_true',
+        help='remove an existing configuration')
+    parser.add_argument('-i', '--import', dest='importing', action='store_true',
+        help='import an existing configuration')
+    parser.add_argument('-e', '--distribute', action='store_true',
+        help='distribute gnt-os-builder and all configurations to the cluster')
+    parser.add_argument('-ls', '--list', action='store_true',
+        help='list all the os configurations installed')
+    args = parser.parse_args()
+    loglevel = eval('logging.%s' % str(args.loglevel).upper())
+    logging.basicConfig(level=loglevel, filename=args.log)
+    runner = BuilderRunner(args)
+    runner.run()
+
+if __name__ == '__main__':
+    main()
+    

@@ -1,0 +1,233 @@
+#!/usr/bin/python
+""""""
+__VERSION__ = '0.1'
+__AUTHOR__  = 'Bram Swenson <bram@craniumisajar.com>'
+
+import logging
+import sys
+import os
+import shutil
+import tempfile
+import traceback
+
+import parted
+
+from utils import CleanupRunner
+from utils import run_command
+from utils import run_command_chrooted
+from configurations import CoreConfiguration
+from configurations import OsConfiguration
+from environment import get_ganeti_environment
+from disk import parse_disk_configuration
+from disk import Disk
+from disk import Partition
+from disk import FSTYPES
+from disk import mount
+from disk import umount
+from disk import rm_dev
+from disk import write_fstab
+from net import write_interfaces
+from net import write_hosts
+from debootstrap import debootstrap_unpacktarball
+
+    
+class CreateRunner(CleanupRunner):
+    def __init__(self, *args, **kwargs):
+        super(CreateRunner, self).__init__(self, *args, **kwargs)
+        # get the env vars set by ganeti
+        self.env = get_ganeti_environment()
+        logging.info('%s initialized with environment\n%s' % (
+            self.__class__.__name__, self.env))
+        # load core config
+        #self.core_config = CoreConfiguration()
+        # determine our directory os_install_dir and os.conf path
+        os_install_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+        os_config_path = os.path.join(os_install_dir, 'os.conf')
+        # load the os config
+        self.os_config = OsConfiguration(os_config_path)
+        self.os_config.read()
+        self.os_name = self.os_config.get('os', 'name')
+        self.os_arch = self.os_config.get('os', 'arch')
+        self.os_suite = self.os_config.get('os', 'suite')
+        self.os_packages = self.os_config.get('os', 'packages').split(',')
+        self.os_disks = self.os_config.get('os', 'disks').split(',')
+        logging.info('%s configuration loaded: %s' % (
+            self.__class__.__name__, os_config_path))
+
+    def validate_disks(self):
+        logging.info('%s validating disk env input with os config' % (
+            self.__class__.__name__))
+        # get a list of parts requested by the config
+        parts = [ parse_disk_configuration(disk) for disk in self.os_disks ]
+        # check if we have the right number of disks
+        disk_numbers = []
+        for part in parts:
+            if part['disk'] not in disk_numbers:
+                disk_numbers.append(part['disk'])
+        if len(disk_numbers) != int(self.env['DISK_COUNT']):
+            raise ValueError(
+                '%s config requires %s disks but env has %s disks' % (
+                self.__class__.__name__, len(disk_numbers),
+                self.env['DISK_COUNT']))
+        logging.info(
+            '%s number of disks required equals number of disks provided' % (
+            self.__class__.__name__))
+        # create Disks object for each we need
+        self.disks = {}
+        for n in [ str(n) for n in disk_numbers ]:
+            self.disks[n] = Disk(n, self.env['DISK_%s_PATH' % n])
+        # now add each part to the proper disk (which in turn checks for free
+        # space available)
+        for part in parts:
+            self.disks[part['disk']].add_partition(part['part'], part['size'],
+                                                   part['fstype'],
+                                                   path=part['path'])
+        logging.info('%s all disks verified and ready for partitioning' % (
+            self.__class__.__name__))
+        logging.debug('%s resulting layout:' % (self.__class__.__name__))
+        for disk in self.disks:
+            logging.debug('%s        %s' % (self.__class__.__name__,
+                                            self.disks[disk].pdisk))
+    
+    def commit_disks(self):
+        for disk in self.disks.values():
+            disk.commit()
+
+    def mount_disks_to_tmpfs(self):
+        # get a secure tempdir
+        tmpdir = tempfile.mkdtemp(prefix='gnt-os-builder-')
+        root = None
+        others = []
+        for disk in self.disks.values():
+            for part in disk.partitions:
+                if part.path == '/':
+                    logging.debug('%s found root partition: %s' % (
+                        self.__class__.__name__, part))
+                    root = part
+                elif part.path:
+                    logging.debug('%s found other partition: %s' % (
+                        self.__class__.__name__, part))
+                    others.append(part)
+                else:
+                    logging.debug('%s found unmountable partition: %s' % (
+                        self.__class__.__name__, part))
+        # mount the root part to the tmpdir
+        logging.debug('%s mounting root partition to tmpfs %s' % (
+            self.__class__.__name__, tmpdir))
+        mount_out = mount(root.ppartition.path, tmpdir)
+        # add an cleanup command to unmount later
+        self.add_cleanup_command(umount, tmpdir)
+        for subpart in others:
+            subpath = os.path.join(tmpdir, subpart.path[1:]) # hack off /
+            logging.debug('%s mounting subpart %s to %s' % (self.__class__.__name__,
+                subpart.path, subpath))
+            os.mkdir(subpath)
+            submount_out = mount(subpart.ppartition.path, subpath)
+            self.add_cleanup_command(umount, subpath)
+        return tmpdir
+
+    def delete_disk_devs(self):
+        for disk in self.disks.values():
+            rm_dev(disk.path)
+
+    def configure_new_os(self, tmpdir):
+        # write hosts to tmpdir
+        write_hosts(tmpdir, self.env['INSTANCE_NAME'])
+        # write interfaces to tmpdir
+        write_interfaces(tmpdir, number=self.env['DISK_COUNT'])
+        # write fstab to tmpdir
+        write_fstab(tmpdir, self.disks.values())
+        # see if we have a chroot script at all
+        chroot_script = self.os_config.get('os', 'chroot_script')
+        if not chroot_script or not os.path.exists(chroot_script):
+            return
+        # create a link at /dev/vda to the lvm volume
+        #os.symlink(self.disks['0'].path, '/dev/vda')
+        #self.add_cleanup_command('rm /dev/vda')
+        # mount dev, proc and sysfs to tmpdir
+        tmp_dev = os.path.join(tmpdir, 'dev')
+        mnt_dev = mount('/dev', tmp_dev, cmd_args='--bind')
+        tmp_proc = os.path.join(tmpdir, 'proc')
+        mnt_proc = mount('none', tmp_proc, cmd_args='-t proc')
+        tmp_sys = os.path.join(tmpdir, 'sys')
+        mnt_sys = mount('none', tmp_sys, cmd_args='-t sysfs')
+        # add cleanup commands to unmount dev, proc and sysfs
+        self.add_cleanup_command(umount, tmp_dev)
+        self.add_cleanup_command(umount, tmp_proc)
+        self.add_cleanup_command(umount, tmp_sys)
+        # cp chroot script to tmpdir
+        tmp_chroot_script = os.path.join(tmpdir,
+                                         os.path.basename(chroot_script))
+        shutil.copy(chroot_script, tmp_chroot_script)
+        # chroot run the script
+        chroot_script_path = os.path.join('/', os.path.basename(chroot_script))
+        stdoutdata, stderrdata, runner = run_command_chrooted(tmpdir,
+            chroot_script_path)
+        if runner.returncode != 0:
+            logging.critical('%s chroot script execution failure: %s' % (
+                self.__class__.__name__, stderrdata))
+            raise Exception('chroot_script failure')
+        else:
+            logging.info('%s chroot script execution success: %s' % (
+                self.__class__.__name__, stdoutdata))
+        # do grub install
+        grub_command = 'grub-install --recheck --modules=ext4 --root-directory=%s %s' % ( 
+            tmpdir, self.disks['0'].path)
+        logging.info('%s running grub install: %s' % (self.__class__.__name__,
+            grub_command))
+        stdoutdata, stderrdata, grub_install = run_command(grub_command)
+        if grub_install.returncode != 0:
+            logging.warning('%s grub install failure: %s' % (
+                self.__class__.__name__, stderrdata))
+        else:
+            logging.info('%s grub install success: %s' % (
+                self.__class__.__name__, stdoutdata))
+
+    def check_all_filesystems(self):
+        logging.info('%s checking filesystem for all partitions' % (
+            self.__class__.__name__))
+        for disk in self.disks.values():
+            for part in disk.partitions:
+                part.check_filesystem()
+
+    def run(self):
+        self.clean = False
+        # validate the disk layout in the config matches the env
+        self.validate_disks()
+        # do the partitioning and filesystem creation
+        self.commit_disks()
+        # mount the filesystems
+        tmpdir = self.mount_disks_to_tmpfs()
+        # get the tarball path
+        tarball_path = self.os_config.get('cache', 'tarball_path')
+        # deboostrap the system into tmpdir
+        results = debootstrap_unpacktarball(self.os_suite, tmpdir, tarball_path,
+            #mirror='http://us.archive.ubuntu.com/ubuntu',
+            arch=self.os_arch, include=self.os_packages)
+        # configure the new os in tmpdir
+        self.configure_new_os(tmpdir)
+        # delete the dev mappings
+        self.cleanup()
+        self.clean = True
+        self.check_all_filesystems()
+        self.delete_disk_devs()
+
+
+def main():
+    runner = CreateRunner()
+    exit_code = 0
+    try:
+        runner.run()
+    except Exception, why:
+        logging.info('runner.run had an error: %s' % str(why))
+        logging.info('runner.run error traceback: %s' % traceback.format_exc())
+        exit_code = 1
+    runner.cleanup()
+    sys.exit(exit_code)
+
+
+if __name__ == '__main__':
+    logging.basicConfig(level=logging.DEBUG)
+    main()
+    
+
